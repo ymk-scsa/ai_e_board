@@ -1,0 +1,126 @@
+/* Custom Stylesheet for AI Electronic Blackboard Generation System */
+
+/* Main App Container */
+.main-header {
+    background: linear-gradient(135deg, #1e3a8a 0%, #0f172a 100%);
+    color: #ffffff;
+    padding: 24px 30px;
+    border-radius: 12px;
+    margin-bottom: 24px;
+    box-shadow: 0 10px 25px rgba(0, 0, 0, 0.15);
+}
+
+.main-header h1 {
+    font-size: 2.2rem;
+    font-weight: 800;
+    margin: 0 0 8px 0;
+    color: #f8fafc;
+}
+
+.main-header p {
+    font-size: 1.1rem;
+    color: #cbd5e1;
+    margin: 0;
+}
+
+/* Step Navigation Bar */
+.step-nav {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #f1f5f9;
+    border-radius: 10px;
+    padding: 12px 18px;
+    margin-bottom: 24px;
+    border: 1px solid #e2e8f0;
+}
+
+.step-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 700;
+    font-size: 1.05rem;
+    color: #64748b;
+}
+
+.step-item.active {
+    color: #1e40af;
+}
+
+.step-item.completed {
+    color: #059669;
+}
+
+.step-number {
+    display: inline-flex;
+    justify-content: center;
+    align-items: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: #cbd5e1;
+    color: #334155;
+    font-size: 0.95rem;
+}
+
+.step-item.active .step-number {
+    background: #1e40af;
+    color: #ffffff;
+}
+
+.step-item.completed .step-number {
+    background: #059669;
+    color: #ffffff;
+}
+
+/* Card Box */
+.content-card {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin-bottom: 20px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.03);
+}
+
+.content-card h3 {
+    font-size: 1.3rem;
+    font-weight: 700;
+    color: #1e293b;
+    margin-bottom: 12px;
+}
+
+/* Badge */
+.status-badge {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 9999px;
+    font-size: 0.85rem;
+    font-weight: 700;
+}
+
+.status-badge.success {
+    background: #d1fae5;
+    color: #065f46;
+}
+
+.status-badge.info {
+    background: #dbeafe;
+    color: #1e40af;
+}
+
+.status-badge.warning {
+    background: #fef3c7;
+    color: #92400e;
+}
+
+/* Formula Preview in Editor */
+.math-preview-box {
+    background: #f8fafc;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    padding: 12px 18px;
+    margin-top: 8px;
+    text-align: center;
+}
