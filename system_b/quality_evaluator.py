@@ -6,15 +6,16 @@ Orchestrates quantitative metrics, pedagogical analysis, usability evaluation, a
 import json
 import logging
 import re
+from difflib import SequenceMatcher
 import time
 import uuid
 from datetime import datetime
 from typing import Dict, Any, Optional, Tuple, List
 
-import ollama
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 import config
+from ai.llm_client import LLMBackend, OllamaBackend, default_model_for
 from models.evaluation_schemas import (
     EvaluationResult,
     CategoryScores,
@@ -40,11 +41,22 @@ class QualityEvaluator:
         host: Optional[str] = None,
         model: Optional[str] = None,
         timeout: int = config.EVALUATION_TIMEOUT_SECONDS,
+        llm_backend: Optional[LLMBackend] = None,
     ):
         self.host = host or config.OLLAMA_HOST
-        self.model = model or config.DEFAULT_EVALUATION_MODEL
         self.timeout = timeout
-        self.client = ollama.Client(host=self.host)
+        # LLM補強に使うバックエンド（ai/llm_client.py）。未指定なら Ollama を使う
+        # SSRF対策: 許可リスト外のホストにはクライアントを作成しない（LLM補強はスキップされる）
+        self.host_error: Optional[str] = None
+        self.client: Optional[LLMBackend] = llm_backend
+        if self.client is None:
+            try:
+                self.client = OllamaBackend(host=self.host, timeout=timeout)
+            except ValueError as e:
+                self.host_error = str(e)
+                logger.error(f"Invalid Ollama host rejected: {e}")
+        default_model = default_model_for(llm_backend) if llm_backend else config.DEFAULT_EVALUATION_MODEL
+        self.model = model or default_model
         self.pedagogy_evaluator = PedagogyEvaluator()
         self.usability_evaluator = UsabilityEvaluator()
 
@@ -77,17 +89,13 @@ class QualityEvaluator:
         teaching_guides: List[TeachingGuideItem] = ImprovementGenerator.generate_teaching_guides(material)
 
         # Step 5: Compute unified category scores
-        # Pedagogical structure (0-100)
         ped_score = pedagogy_eval.structure_score
-        # Objective alignment (0-100)
-        obj_score = 90 if pedagogy_eval.has_clear_objectives else 70
-        # Blackboard UX (0-100)
+        obj_score = self.objective_alignment_score(material)
         usa_score = usability_eval.usability_score
-        # Cognitive load balance (0-100)
         dense_count = sum(1 for m in metrics_list if m.density_level == "Dense")
         cog_score = max(60, 95 - (dense_count * 10))
 
-        overall_score = int((ped_score * 0.35) + (obj_score * 0.25) + (usa_score * 0.25) + (cog_score * 0.15))
+        overall_score = int(round((ped_score * 0.35) + (obj_score * 0.25) + (usa_score * 0.25) + (cog_score * 0.15)))
 
         category_scores = CategoryScores(
             pedagogical_structure=ped_score,
@@ -96,24 +104,10 @@ class QualityEvaluator:
             cognitive_load_balance=cog_score,
         )
 
-        # Step 6: Strengths & Attention points
-        strengths = [
-            f"単元「{material.unit}」の学習目標が明瞭であり、授業展開の見通しが良い点",
-            "16:9電子黒板に適したレイアウトで、教室後方からの視認性に配慮されている点",
-            "数学の数式（LaTeX）が美しく配置され、計算プロセスの視覚的追従性が高い点",
-        ]
-        if pedagogy_eval.has_example:
-            strengths.append("例題において思考プロセスと解法ステップが丁寧に構造化されている点")
-
-        points_for_attention = [
-            "例題から演習への移行時、生徒の自力ワーク時間を適切に確保すること",
-            "数式が多いスライドでは、教員が立ち止まって生徒の理解度を確認（発問）すること",
-        ]
-
-        summary_text = (
-            f"本教材（{material.lesson_title}）は総合スコア {overall_score}点（100点満点）と評価されました。"
-            f"授業構成の一貫性と電子黒板としての提示適性が高く、生徒の思考を支援する優れた構成です。"
-        )
+        # Step 6: Strengths, attention points and summary — derived from the results, not canned
+        strengths, points_for_attention = self.describe_results(
+            material, metrics_list, pedagogy_eval, usability_eval, obj_score)
+        summary_text = self.executive_summary(material.lesson_title, overall_score, pedagogy_eval, usability_eval)
 
         # Build preliminary result
         result = EvaluationResult(
@@ -133,7 +127,8 @@ class QualityEvaluator:
             strengths=strengths,
             points_for_attention=points_for_attention,
             executive_summary=summary_text,
-            evaluated_model=self.model if use_llm else "deterministic_rules",
+            # LLM補強が成功した場合のみモデル名を記録する（_try_llm_enrichment で上書き）
+            evaluated_model="deterministic_rules",
         )
 
         # Step 7: Optional LLM qualitative enrichment if Ollama is accessible
@@ -143,9 +138,97 @@ class QualityEvaluator:
                 if enriched_result:
                     return enriched_result
             except Exception as e:
-                logger.info(f"LLM evaluation enrichment skipped or timed out: {e}. Using deterministic evaluation.")
+                logger.warning(f"LLM evaluation enrichment failed: {e}. Using deterministic evaluation.")
 
         return result
+
+    # ------------------------------------------------------------------
+    # Rule-based scoring helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def objective_alignment_score(material: ParsedLessonMaterial) -> int:
+        """0 objectives → 40; objectives present → 75, +10 if they refer to the unit / title, +5 for 2+ items."""
+        objectives = [o for o in material.learning_objectives if o.strip()]
+        if not objectives:
+            return 40
+        score = 75
+        # the objectives refer to the lesson when they share a 3+ character phrase with the unit / title
+        # (Japanese titles have no spaces, so a word split would miss "平方完成による…")
+        reference = f"{material.unit} {material.lesson_title}".replace("要確認", "")
+        joined = " ".join(objectives)
+        match = SequenceMatcher(None, joined, reference, autojunk=False).find_longest_match(0, len(joined), 0, len(reference))
+        if match.size >= 3 and joined[match.a:match.a + match.size].strip():
+            score += 10
+        if len(objectives) >= 2:
+            score += 5
+        return min(100, score)
+
+    @staticmethod
+    def describe_results(material, metrics_list, pedagogy_eval, usability_eval, obj_score):
+        strengths: List[str] = []
+        attention: List[str] = []
+        p = pedagogy_eval
+        if p.has_clear_objectives:
+            strengths.append("本時の目標が明示され、授業の到達点が共有しやすい" if obj_score >= 85
+                             else "本時の目標が示されている")
+        else:
+            attention.append("本時の目標がありません。冒頭で到達目標を示してください")
+        if p.has_example and p.has_exercise:
+            strengths.append("例題で解法を示したあと、練習問題で自力演習につなげる流れがある")
+        elif p.has_example:
+            attention.append("練習問題がありません。例題の直後に類題を1〜2問加えると定着を確認できます")
+        elif p.has_exercise:
+            attention.append("解法を示す例題がありません。練習の前に1問、解き方を示すと取り組みやすくなります")
+        else:
+            attention.append("例題・練習問題がありません")
+        if p.has_summary:
+            strengths.append("まとめで本時の要点を振り返れる")
+        else:
+            attention.append("まとめがありません。最後に要点を1〜2文で確認してください")
+        if not p.has_introduction:
+            attention.append("導入（問いかけ・動機づけ）がありません")
+        split = usability_eval.slide_split_recommended_slides
+        if split:
+            attention.append(f"スライド {', '.join(map(str, split))} は情報量が多いため、分割か段階的な提示を検討してください")
+        elif metrics_list:
+            strengths.append("各スライドの情報量が1画面に収まる範囲に抑えられている")
+        formula_slides = [m.slide_number for m in metrics_list if m.formula_count >= 3]
+        if formula_slides:
+            attention.append(f"数式の多いスライド（{', '.join(map(str, formula_slides))}）では、途中で発問して理解を確認してください")
+        return strengths, attention
+
+    @staticmethod
+    def executive_summary(title: str, overall: int, pedagogy_eval, usability_eval) -> str:
+        if overall >= 85:
+            verdict = "授業の基本要素が揃い、電子黒板としての提示にも適した完成度の高い教材です。"
+        elif overall >= 70:
+            verdict = "おおむね良好な構成です。下記の注意点を確認すると、さらに使いやすくなります。"
+        else:
+            verdict = "授業の要素が不足しているため、改善提案を参考に補ってください。"
+        return f"本教材（{title}）の総合スコアは {overall} 点（100点満点）です。{verdict}"
+
+    @staticmethod
+    def build_llm_prompt(material: ParsedLessonMaterial, base_result: EvaluationResult,
+                         custom_focus: Optional[str] = None) -> str:
+        prompt_file = config.PROMPTS_DIR / "evaluate_quality.txt"
+        base_prompt = prompt_file.read_text(encoding="utf-8") if prompt_file.exists() else ""
+        metrics = {m.slide_number: m for m in base_result.slide_metrics}
+        digest = []
+        for s in material.slides:
+            m = metrics.get(s.slide_number)
+            info = f"（{m.char_count}字・式{m.formula_count}・{m.density_level}）" if m else ""
+            excerpt = re.sub(r"\s+", " ", s.body_text)[:60]
+            digest.append(f"S{s.slide_number}［{s.badge}］{s.title}{info}: {excerpt}")
+        objectives = " / ".join(material.learning_objectives) or "（なし）"
+        focus = f"\n【教員の重点】{custom_focus}" if custom_focus else ""
+        return (
+            f"{base_prompt}\n"
+            f"【教材】{material.lesson_title}（{material.unit}）\n【目標】{objectives}\n"
+            f"【スライド】\n" + "\n".join(digest) + focus + "\n\n"
+            "次のJSONだけを出力してください（総評は120字以内、各項目は60字以内・3項目まで）:\n"
+            '{"executive_summary": "総評", "strengths": ["良い点"], "points_for_attention": ["注意点"]}'
+        )
 
     def _try_llm_enrichment(
         self,
@@ -153,69 +236,57 @@ class QualityEvaluator:
         base_result: EvaluationResult,
         custom_focus: Optional[str] = None,
     ) -> Optional[EvaluationResult]:
-        """Attempt to call Ollama LLM to refine qualitative feedback and suggestions."""
-        prompt_template = config.PROMPTS_DIR / "evaluate_quality.txt"
-        base_prompt = prompt_template.read_text(encoding="utf-8") if prompt_template.exists() else ""
-
-        # Prepare payload for LLM
-        summary_payload = {
-            "lesson_title": material.lesson_title,
-            "unit": material.unit,
-            "subject": material.subject,
-            "objectives": material.learning_objectives,
-            "slides_count": len(material.slides),
-            "slides_summary": [
-                {
-                    "slide_number": s.slide_number,
-                    "title": s.title,
-                    "badge": s.badge,
-                    "body_excerpt": s.body_text[:150],
-                    "formula_count": len(s.formulas),
-                }
-                for s in material.slides
-            ],
-            "preliminary_metrics": [m.model_dump() for m in base_result.slide_metrics],
-        }
-
-        full_prompt = f"""{base_prompt}
-
-【分析対象教材データ】
-```json
-{json.dumps(summary_payload, ensure_ascii=False, indent=2)}
-```
-
-{f'【教員からの評価重点指示】: {custom_focus}' if custom_focus else ''}
-
-以下のJSON形式で評価結果を出力してください。
-```json
-{{
-  "overall_score": {base_result.overall_score},
-  "executive_summary": "総合評価のコメント",
-  "strengths": ["良い点1", "良い点2"],
-  "points_for_attention": ["注意点1", "注意点2"]
-}}
-```
-"""
-        response = self.client.generate(
-            model=self.model,
-            prompt=full_prompt,
-            options={"temperature": 0.2},
-        )
-        raw_resp = response.get("response", "") if isinstance(response, dict) else getattr(response, "response", "")
+        """
+        Ask the local LLM for a short qualitative review. The input is a compact one-line-per-slide digest
+        and the output is length-limited, because on small GPUs time grows with prompt and answer length.
+        """
+        if self.client is None:
+            raise ConnectionError(self.host_error or "LLMクライアントが初期化されていません。")
+        full_prompt = self.build_llm_prompt(material, base_result, custom_focus)
+        raw_resp = self.client.generate(self.model, full_prompt, max_tokens=config.EVALUATION_MAX_OUTPUT_TOKENS,
+                                        temperature=0.2).text
 
         # Extract JSON
         match = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", raw_resp)
         json_str = match.group(1) if match else raw_resp[raw_resp.find("{") : raw_resp.rfind("}") + 1]
 
-        if json_str:
-            llm_dict = json.loads(json_str)
-            if "executive_summary" in llm_dict:
-                base_result.executive_summary = llm_dict["executive_summary"]
-            if "strengths" in llm_dict and isinstance(llm_dict["strengths"], list):
-                base_result.strengths = llm_dict["strengths"]
-            if "points_for_attention" in llm_dict and isinstance(llm_dict["points_for_attention"], list):
-                base_result.points_for_attention = llm_dict["points_for_attention"]
-            if "overall_score" in llm_dict and isinstance(llm_dict["overall_score"], int):
-                base_result.overall_score = max(0, min(100, llm_dict["overall_score"]))
-
+        if not json_str:
+            return None
+        # Validate the model output; it may refine the wording only. Scores stay rule-based so that the
+        # overall score always agrees with the category scores.
+        feedback = LLMFeedback.model_validate(json.loads(json_str))
+        if feedback.executive_summary:
+            base_result.executive_summary = feedback.executive_summary
+        if feedback.strengths:
+            base_result.strengths = feedback.strengths
+        if feedback.points_for_attention:
+            base_result.points_for_attention = feedback.points_for_attention
+        base_result.evaluated_model = self.model
         return base_result
+
+
+class LLMFeedback(BaseModel):
+    """
+    Accepted shape of the LLM's qualitative feedback. Extra keys (e.g. a score) are ignored; over-long
+    text is clipped rather than rejected so that a long but valid answer is not thrown away.
+    """
+    executive_summary: Optional[str] = None
+    strengths: List[str] = Field(default_factory=list)
+    points_for_attention: List[str] = Field(default_factory=list)
+
+    @field_validator("executive_summary", mode="before")
+    @classmethod
+    def _clip_summary(cls, v):
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            raise ValueError("must be a string")
+        return v.strip()[:300] or None
+
+    @field_validator("strengths", "points_for_attention", mode="before")
+    @classmethod
+    def _non_empty_strings(cls, v):
+        """Keep non-empty strings only (small models sometimes emit numbers or blanks); a non-list is invalid."""
+        if not isinstance(v, list):
+            raise ValueError("must be a list")
+        return [s.strip()[:120] for s in v if isinstance(s, str) and s.strip()][:5]

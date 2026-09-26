@@ -35,4 +35,4 @@ def test_pedagogy_evaluation_complete_flow():
     assert res.has_example is True
     assert res.has_exercise is True
     assert res.has_summary is True
-    assert "適合しています" in res.curriculum_alignment_analysis
+    assert "対応しています" in res.curriculum_alignment_analysis

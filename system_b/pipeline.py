@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Union, Tuple
 
 import config
+from ai.llm_client import LLMBackend
 from models.schemas import Lesson, ElectronicBoardPresentation
 from models.evaluation_schemas import EvaluationResult
 from system_b.analyzer import MaterialAnalyzer, ParsedLessonMaterial
@@ -25,8 +26,9 @@ class EvaluationPipeline:
         self,
         host: Optional[str] = None,
         model: Optional[str] = None,
+        llm_backend: Optional[LLMBackend] = None,
     ):
-        self.evaluator = QualityEvaluator(host=host, model=model)
+        self.evaluator = QualityEvaluator(host=host, model=model, llm_backend=llm_backend)
         self.report_generator = ReportGenerator()
 
     def evaluate_from_lesson(

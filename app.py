@@ -4,15 +4,17 @@ Supports multi-image blackboard analysis, educational JSON structuring, teacher 
 and 16:9 KaTeX-powered electronic blackboard presentation generation.
 """
 
+import html
 import json
 import logging
 import os
 import shutil
 import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Add project root to path
 BASE_DIR = Path(__file__).resolve().parent
@@ -24,10 +26,11 @@ from PIL import Image
 
 import config
 from ai.vision import VisionAnalyzer
-from ai.parser import LessonParser
 from ai.generator import ElectronicBoardGenerator
 from ai.evaluator import CurriculumAlignmentEvaluator, PedagogicalQualityEvaluator
-from models.schemas import Lesson, Section, Formula, ExampleProblem, Exercise, VisualAnnotation
+from ai.security import safe_upload_path, validate_ollama_host
+from models.schemas import Lesson, Section, Formula, ExampleProblem, Exercise, VisualAnnotation, lesson_fingerprint
+from models.samples import get_mock_lesson_for_sample
 from ui.board import BlackboardUI
 from system_b.pipeline import EvaluationPipeline
 from ui.evaluation import EvaluationUI
@@ -59,13 +62,133 @@ def init_session_state():
         st.session_state.saved_json_path = None
     if "saved_html_path" not in st.session_state:
         st.session_state.saved_html_path = None
-    if "ollama_model" not in st.session_state:
-        st.session_state.ollama_model = config.DEFAULT_VISION_MODEL
+    # 生成済みスライドがどの授業データから作られたか（授業データの変更後に古いスライドを使わないため）
+    if "presentation_lesson_hash" not in st.session_state:
+        st.session_state.presentation_lesson_hash = None
+    if "llm_backend_kind" not in st.session_state:
+        st.session_state.llm_backend_kind = config.LLM_BACKEND
+    if "llm_model" not in st.session_state:
+        st.session_state.llm_model = None  # None: バックエンドの既定モデル
     if "ollama_host" not in st.session_state:
         st.session_state.ollama_host = config.OLLAMA_HOST
     if "theme" not in st.session_state:
         st.session_state.theme = config.DEFAULT_THEME
+    # デモ用サンプル授業（解析結果ではない）を使用中かどうか
+    if "is_mock" not in st.session_state:
+        st.session_state.is_mock = False
+    # 直近のAI解析失敗情報 {"message": str, "raw_text": str}
+    if "analysis_error" not in st.session_state:
+        st.session_state.analysis_error = None
+    # アップロード保存先を分離するためのセッションID
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = uuid.uuid4().hex
+    # 再実行ごとの再保存を避けるためのキャッシュ {upload_key: saved_path}
+    if "upload_cache" not in st.session_state:
+        st.session_state.upload_cache = {}
 
+
+SECTION_TYPE_OPTIONS = ["introduction", "concept", "definition", "formula", "example", "exercise", "summary", "custom"]
+
+DERIVED_STATE_KEYS = (
+    "generated_presentation", "presentation_html", "saved_json_path", "saved_html_path",
+    "presentation_lesson_hash", "eval_result", "eval_json_path", "eval_html_path",
+)
+
+
+def find_unconfirmed_fields(lesson: Lesson) -> List[str]:
+    """Human-readable locations of fields the AI marked as 要確認 (unreadable / not on the board)."""
+    found = []
+    if "要確認" in (lesson.grade or ""):
+        found.append("学年")
+    if "要確認" in lesson.unit:
+        found.append("単元名")
+    for sec in lesson.sections:
+        if sec.example and "要確認" in sec.example.answer:
+            found.append(f"{sec.title} の答え")
+        if sec.exercise and "要確認" in (sec.exercise.answer or ""):
+            found.append(f"{sec.title} の解答")
+    return found
+
+
+def reset_derived_state() -> None:
+    """Clear everything generated from the current lesson (slides, saved paths, evaluation)."""
+    for key in DERIVED_STATE_KEYS:
+        st.session_state[key] = None
+
+
+def set_lesson(lesson: Optional[Lesson]) -> None:
+    """Replace the working lesson; derived artifacts are invalidated whenever the content changes."""
+    if lesson_fingerprint(lesson) != lesson_fingerprint(st.session_state.get("parsed_lesson")):
+        reset_derived_state()
+    st.session_state.parsed_lesson = lesson
+
+
+def analyze_and_parse(
+    vision_analyzer: VisionAnalyzer,
+    image_paths: List[Path],
+    image_names: List[str],
+    custom_instructions: Optional[str] = None,
+    model_override: Optional[str] = None,
+    on_progress=None,
+    on_phase=None,
+) -> Tuple[Optional[Lesson], Optional[str], Dict[str, Any]]:
+    """
+    Run the two-stage board analysis (transcribe → structure). Never substitutes a mock lesson.
+    Returns (lesson or None, error message or None, analysis info dict).
+    """
+    try:
+        res = vision_analyzer.analyze_board_to_lesson(
+            image_paths=image_paths,
+            custom_instructions=custom_instructions,
+            model_override=model_override,
+            on_phase=on_phase,
+            on_progress=on_progress,
+        )
+    except (FileNotFoundError, ValueError) as e:
+        return None, f"Vision AI の呼び出しに失敗しました: {e}", {"success": False, "error": str(e), "raw_text": ""}
+
+    info: Dict[str, Any] = {
+        "success": res.lesson is not None,
+        "error": res.error,
+        "raw_text": res.transcript,          # 書き起こし（デバッグ表示用）
+        "structure_text": res.structure,
+        "structure_fallback": res.structure_fallback,
+        "parse_warnings": res.warnings,
+        "model": res.model,
+        "backend": vision_analyzer.backend_name,
+        "device": res.device,
+        "elapsed_seconds": res.timings.get("total"),
+        "timings": res.timings,
+        "source_images": image_names,
+        "is_mock": False,
+    }
+    if res.lesson is None:
+        return None, res.error or "板書の解析に失敗しました。", info
+    return res.lesson, None, info
+
+
+def _copy_sample_to_uploads(src: Path) -> Path:
+    """Copy a bundled test image into the per-session upload dir with a safe generated name."""
+    dest = safe_upload_path(
+        src.name, config.UPLOAD_DIR, st.session_state.session_id, config.ALLOWED_IMAGE_EXTENSIONS
+    )
+    shutil.copy(src, dest)
+    return dest
+
+
+
+@st.cache_resource(show_spinner="AI実行環境を確認しています…")
+def get_vision_analyzer(backend_kind: str, ollama_host: str) -> VisionAnalyzer:
+    """Backend discovery spawns CLI processes; cache the analyzer across reruns."""
+    return VisionAnalyzer(host=ollama_host, backend_kind=backend_kind)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def get_backend_status(_vision_analyzer: VisionAnalyzer, cache_key: tuple) -> Tuple[bool, str, List[str], str]:
+    """(is_connected, message, models, device of the selected model). cache_key = (kind, host, model)."""
+    ok, msg, models = _vision_analyzer.check_connection()
+    device = _vision_analyzer.model_device(cache_key[2]) if ok else "unknown"
+    return ok, msg, models, device
 
 
 def render_sidebar(vision_analyzer: VisionAnalyzer):
@@ -88,42 +211,70 @@ def render_sidebar(vision_analyzer: VisionAnalyzer):
     st.sidebar.markdown("---")
     st.sidebar.title("⚙️ システム設定")
 
-    # Ollama Host Setting
-    host_input = st.sidebar.text_input(
-        "Ollama 接続ホスト",
-        value=st.session_state.ollama_host,
-        help="OllamaのローカルAPIエンドポイント（通常: http://localhost:11434）",
+    # AI実行環境（ローカルLLMバックエンド）の選択
+    backend_labels = {
+        "auto": "自動（GPUで動く環境を優先）",
+        "foundry": "Foundry Local",
+        "ollama": "Ollama",
+        "openai": "OpenAI互換サーバー",
+    }
+    kinds = list(backend_labels)
+    selected_kind = st.sidebar.selectbox(
+        "AI実行環境",
+        options=kinds,
+        index=kinds.index(st.session_state.llm_backend_kind) if st.session_state.llm_backend_kind in kinds else 0,
+        format_func=lambda k: backend_labels[k],
+        help="画像解析に使うローカルLLMの実行環境。自動では Foundry Local → Ollama の順にGPU動作を確認します。",
     )
-
-    if host_input != st.session_state.ollama_host:
-        st.session_state.ollama_host = host_input
+    if selected_kind != st.session_state.llm_backend_kind:
+        st.session_state.llm_backend_kind = selected_kind
+        st.session_state.llm_model = None
         st.rerun()
 
-    # Ollama Health Check & Model List
-    is_connected, msg, available_models = vision_analyzer.check_connection()
+    if selected_kind == "ollama":
+        host_input = st.sidebar.text_input(
+            "Ollama 接続ホスト",
+            value=st.session_state.ollama_host,
+            help="OllamaのローカルAPIエンドポイント（通常: http://localhost:11434）",
+        )
+        if host_input != st.session_state.ollama_host:
+            # SSRF対策: 許可リスト外のホストには接続しない（直前の接続先を維持）
+            try:
+                validated_host = validate_ollama_host(host_input)
+            except ValueError as e:
+                st.sidebar.error(f"⛔ {e}\n\n直前の接続先（{st.session_state.ollama_host}）を維持します。")
+            else:
+                st.session_state.ollama_host = validated_host
+                st.rerun()
+
+    is_connected, msg, available_models, device = get_backend_status(
+        vision_analyzer, (selected_kind, st.session_state.ollama_host, st.session_state.llm_model or vision_analyzer.model)
+    )
 
     if is_connected:
-        st.sidebar.success(f"🟢 Ollama 接続中 ({len(available_models)} モデル)")
-        # Model Selection
-        model_options = list(dict.fromkeys(available_models + config.CANDIDATE_VISION_MODELS))
-        selected_idx = 0
-        if st.session_state.ollama_model in model_options:
-            selected_idx = model_options.index(st.session_state.ollama_model)
-
+        backend_title = backend_labels.get(vision_analyzer.backend_name, vision_analyzer.backend_name)
+        if device == "gpu":
+            st.sidebar.success(f"🟢 {backend_title} 接続中（GPU で実行）")
+        elif device == "unknown":
+            st.sidebar.info(f"🔵 {backend_title} 接続中（実行デバイスは初回解析時に確認します）")
+        else:
+            st.sidebar.warning(f"🟡 {backend_title} 接続中ですが **{device.upper()}** で実行されます。GPU実行が必須の設定では解析できません。")
+        model_options = list(dict.fromkeys(([vision_analyzer.model] if vision_analyzer.model else []) + available_models))
+        current = st.session_state.llm_model or vision_analyzer.model
         selected_model = st.sidebar.selectbox(
             "Vision AI モデル選択",
             options=model_options,
-            index=selected_idx,
-            help="画像解析に対応したVision LLM（Qwen3-VL, LLaMA 3.2 Vision等）を選択してください",
+            index=model_options.index(current) if current in model_options else 0,
+            help="画像解析に対応したモデルを選択してください（Foundry Local の既定: qwen3.5-4b）",
         )
-        st.session_state.ollama_model = selected_model
+        st.session_state.llm_model = selected_model
     else:
-        st.sidebar.warning(f"🟡 Ollama 未接続または待機中\n\n{msg}")
-        custom_model = st.sidebar.text_input(
-            "モデル名（直接入力）",
-            value=st.session_state.ollama_model,
-        )
-        st.session_state.ollama_model = custom_model
+        st.sidebar.error(f"🔴 AI実行環境に接続できません\n\n{msg}\n\n`python tools/setup_llm.py` で診断できます。")
+
+    if st.sidebar.button("🔄 AI実行環境を再確認", use_container_width=True):
+        get_vision_analyzer.clear()
+        get_backend_status.clear()
+        st.rerun()
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("🔬 研究用テスト板書")
@@ -134,8 +285,9 @@ def render_sidebar(vision_analyzer: VisionAnalyzer):
         if st.button("① 順列の板書", use_container_width=True):
             p1 = config.TEST_DATA_DIR / "sample_permutation_board.png"
             if p1.exists():
-                dest = config.UPLOAD_DIR / p1.name
-                shutil.copy(p1, dest)
+                dest = _copy_sample_to_uploads(p1)
+                st.session_state.is_mock = False
+                st.session_state.analysis_error = None
                 st.session_state.uploaded_image_paths = [dest]
                 st.session_state.uploaded_image_names = [p1.name]
                 st.session_state.current_step = 2
@@ -147,8 +299,9 @@ def render_sidebar(vision_analyzer: VisionAnalyzer):
         if st.button("② 平方完成の板書", use_container_width=True):
             p2 = config.TEST_DATA_DIR / "sample_quadratic_board.png"
             if p2.exists():
-                dest = config.UPLOAD_DIR / p2.name
-                shutil.copy(p2, dest)
+                dest = _copy_sample_to_uploads(p2)
+                st.session_state.is_mock = False
+                st.session_state.analysis_error = None
                 st.session_state.uploaded_image_paths = [dest]
                 st.session_state.uploaded_image_names = [p2.name]
                 st.session_state.current_step = 2
@@ -158,162 +311,6 @@ def render_sidebar(vision_analyzer: VisionAnalyzer):
 
     st.sidebar.markdown("---")
     st.sidebar.caption("AI Electronic Blackboard System v1.0\nPrototype for Educational Research")
-
-
-def get_mock_lesson_for_sample(image_name: str) -> Lesson:
-    """Generate high-fidelity structured Lesson when running in offline/mock simulation mode."""
-    if "quadratic" in image_name.lower():
-        return Lesson(
-            subject="数学",
-            grade="高校1年 (数学I)",
-            unit="2次関数とグラフ",
-            lesson_title="2次関数の平方完成とグラフの頂点",
-            learning_objectives=[
-                "2次式 ax² + bx + c を平方完成の形 a(x-p)² + q に変形できる。",
-                "平方完成により放物線の頂点 (p, q) と軸の方程式 x=p を求めることができる。",
-            ],
-            introduction="一般形 y = 2x² - 4x + 5 からグラフの頂点を直接読み取ることは困難であるため、標準形に変形する平方完成を学ぶ。",
-            sections=[
-                Section(
-                    section_id="sec_01",
-                    section_type="definition",
-                    title="基本形と頂点・軸の関係",
-                    content="2次関数を $y = a(x-p)^2 + q$ の形に直すと、頂点の座標が $(p, q)$、軸の方程式が $x = p$ であることが直ちにわかる。",
-                    formulas=[
-                        Formula(
-                            raw_text="y = a(x - p)^2 + q",
-                            latex="y = a(x - p)^2 + q",
-                            description="2次関数の標準形（頂点・軸表示）",
-                            is_key_formula=True,
-                        )
-                    ],
-                    visual_annotations=[
-                        VisualAnnotation(element_type="box", target_text="y = a(x - p)^2 + q", color="red", note="最重要基本形")
-                    ],
-                    order=1,
-                ),
-                Section(
-                    section_id="sec_02",
-                    section_type="example",
-                    title="例題：平方完成の計算",
-                    content="2次関数 $y = 2x^2 - 4x + 5$ を平方完成し、頂点と軸を求めよう。",
-                    formulas=[
-                        Formula(
-                            raw_text="y = 2(x - 1)^2 + 3",
-                            latex="y = 2(x - 1)^2 + 3",
-                            description="変形完了した式",
-                            is_key_formula=True,
-                        )
-                    ],
-                    example=ExampleProblem(
-                        title="例題1",
-                        problem="2次関数 $y = 2x^2 - 4x + 5$ を平方完成し、放物線の頂点と軸を求めよ。",
-                        approach="x² の係数 2 で x の項までを括り、かっこの中で $(x - 1)^2 - 1$ の形を作る。",
-                        solution_steps=[
-                            "$y = 2(x^2 - 2x) + 5$ (係数2で括る)",
-                            r"$y = 2\{(x - 1)^2 - 1^2\} + 5$ (xの係数の半分の2乗を引く)",
-                            "$y = 2(x - 1)^2 - 2 + 5$ (分配法則)",
-                            "$y = 2(x - 1)^2 + 3$",
-                        ],
-                        answer="頂点 $(1, 3)$, 軸の直線 $x = 1$",
-                        teaching_notes="符号ミス（-1の2乗の引き忘れ、カッコの外への展開時の掛け忘れ）に注意を促す。",
-                    ),
-                    order=2,
-                ),
-                Section(
-                    section_id="sec_03",
-                    section_type="exercise",
-                    title="練習問題",
-                    content="各自でノートに平方完成の計算を行い、頂点と軸を求めましょう。",
-                    exercise=Exercise(
-                        title="練習1",
-                        problem="次の2次関数のグラフの頂点と軸を求めよ。\n(1) $y = x^2 - 6x + 2$\n(2) $y = 3x^2 + 12x - 1$",
-                        hint="(1) はそのまま $(x-3)^2$ を作る。(2) はまず 3 で括る。",
-                        answer="(1) 頂点 $(3, -7)$, 軸 $x = 3$ / (2) 頂点 $(-2, -13)$, 軸 $x = -2$",
-                        solution_steps=[
-                            "(1) $y = (x-3)^2 - 9 + 2 = (x-3)^2 - 7$",
-                            r"(2) $y = 3(x^2+4x) - 1 = 3\{(x+2)^2-4\} - 1 = 3(x+2)^2 - 13$",
-                        ],
-                    ),
-                    order=3,
-                ),
-            ],
-            summary="平方完成の3ステップ（括る → 半分の2乗を作る → 定数項を整理する）を確実に身につけ、一般形からグラフを正確に描けるようにしよう。",
-            notes_for_teacher="特に分配法則で係数aを外に出す際の符号と定数の計算ミスが頻発するため、机間巡視で確認すること。",
-        )
-
-    # Default: Permutation board
-    return Lesson(
-        subject="数学",
-        grade="高校1年 (数学A)",
-        unit="場合の数と確率 - 順列",
-        lesson_title="順列の考え方と計算公式 nPr",
-        learning_objectives=[
-            "異なるものからいくつかを選んで並べる「順列」の意味を理解する。",
-            "積の法則を活用して順列の総数を求め、記号 nPr の計算ができる。",
-        ],
-        introduction="4曲から3曲を選んで演奏順を決める身近な問題を題材に、順序を区別する並べ方の総数を考えます。",
-        sections=[
-            Section(
-                section_id="sec_01",
-                section_type="introduction",
-                title="導入課題：曲の演奏順",
-                content="4曲 a, b, c, d から異なる3曲を選んで演奏するとき、演奏する「曲の順序」を考えると何通りあるだろうか？",
-                example=ExampleProblem(
-                    title="導入問題",
-                    problem="4曲 a, b, c, d から異なる3曲を選んで曲順を決める方法は何通りあるか。",
-                    approach="1曲目、2曲目、3曲目と順番に選ぶときの選択肢の数を考える。",
-                    solution_steps=[
-                        "1曲目: 4通り (a, b, c, d のいずれか)",
-                        "2曲目: 3通り (1曲目で選んだものを除く3通り)",
-                        "3曲目: 2通り (残り2通り)",
-                        "積の法則より: $4 \\times 3 \\times 2 = 24$",
-                    ],
-                    answer="24 通り",
-                ),
-                order=1,
-            ),
-            Section(
-                section_id="sec_02",
-                section_type="formula",
-                title="順列の定義と計算公式",
-                content="異なる $n$ 個のものから異なる $r$ 個を取り出して1列に並べる並べ方を **順列 (Permutation)** といい、その総数を ${}_{n}P_{r}$ で表す。",
-                formulas=[
-                    Formula(
-                        raw_text="nPr = n * (n-1) * (n-2) * ... * (n-r+1)",
-                        latex="{}_{n}P_{r} = n(n-1)(n-2)\\cdots(n-r+1)",
-                        description="順列の総数（nから1ずつ減らしてr個の数を掛け算する）",
-                        is_key_formula=True,
-                    ),
-                    Formula(
-                        raw_text="4P3 = 4 * 3 * 2 = 24",
-                        latex="{}_{4}P_{3} = 4 \\times 3 \\times 2 = 24",
-                        description="4曲から3曲選ぶ順列の計算例",
-                        is_key_formula=True,
-                    ),
-                ],
-                visual_annotations=[
-                    VisualAnnotation(element_type="box", target_text="{}_{n}P_{r}", color="red", note="最重要公式")
-                ],
-                order=2,
-            ),
-            Section(
-                section_id="sec_03",
-                section_type="exercise",
-                title="練習問題",
-                content="順列の計算公式を使って、次の値を求めましょう。",
-                exercise=Exercise(
-                    title="練習問題（問1・問2）",
-                    problem="問1. 次の値を求めよ。\n(1) ${}_{5}P_{2}$\n(2) ${}_{6}P_{3}$\n(3) ${}_{4}P_{4}$\n\n問2. 5人の生徒の中から走る順番を決めて3人のリレー選手を選ぶ方法は何通りか。",
-                    hint="問1: 公式通り掛け算する。問2: 順番を区別するので順列を利用する。",
-                    answer="問1: (1) 20, (2) 120, (3) 24 / 問2: 60通り (${}_{5}P_{3} = 5 \\times 4 \\times 3 = 60$)",
-                ),
-                order=3,
-            ),
-        ],
-        summary="「並べる順序」を区別するときは順列 ${}_{n}P_{r}$ を用いる。$n$ からスタートして 1 ずつ減らしながら $r$ 個の数を掛け合わせる！",
-        notes_for_teacher="生徒が組合せ(nCr)と混同しないよう、「順序を区別する」点（リレーの走順など）を強く意識づけること。",
-    )
 
 
 def main():
@@ -327,17 +324,15 @@ def main():
     init_session_state()
     BlackboardUI.load_custom_css()
 
-    vision_analyzer = VisionAnalyzer(
-        host=st.session_state.ollama_host,
-        model=st.session_state.ollama_model,
-    )
+    vision_analyzer = get_vision_analyzer(st.session_state.llm_backend_kind, st.session_state.ollama_host)
     render_sidebar(vision_analyzer)
 
     # If System B mode is selected, render System B
     if st.session_state.app_mode.startswith("📊"):
         pipeline = EvaluationPipeline(
             host=st.session_state.ollama_host,
-            model=st.session_state.ollama_model,
+            model=st.session_state.llm_model or vision_analyzer.model,
+            llm_backend=vision_analyzer.backend,
         )
         EvaluationUI.render_evaluation_view(pipeline)
         return
@@ -360,6 +355,10 @@ def main():
     # Step Progress Indicator
     BlackboardUI.render_step_progress_bar(st.session_state.current_step)
 
+    # デモ用サンプル授業を使用中は常に警告を表示（STEP3〜5）
+    if st.session_state.current_step >= 3 and st.session_state.is_mock:
+        st.warning("⚠️ **デモ用サンプル授業を表示中です。** これはアップロードされた板書画像のAI解析結果ではありません。研究ログには `is_mock: true` として記録されます。")
+
     # ----------------------------------------------------
     # STEP 1: 板書計画をアップロード
     # ----------------------------------------------------
@@ -381,9 +380,25 @@ def main():
             cols = st.columns(min(len(uploaded_files), 3))
             
             for idx, uploaded_file in enumerate(uploaded_files):
-                dest_path = config.UPLOAD_DIR / uploaded_file.name
-                with open(dest_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
+                # パストラバーサル対策: 元のファイル名は表示用のみ。保存名はUUIDで生成する
+                upload_key = getattr(uploaded_file, "file_id", None) or f"{uploaded_file.name}:{uploaded_file.size}"
+                cached = st.session_state.upload_cache.get(upload_key)
+                if cached and Path(cached).exists():
+                    dest_path = Path(cached)
+                else:
+                    try:
+                        dest_path = safe_upload_path(
+                            uploaded_file.name,
+                            config.UPLOAD_DIR,
+                            st.session_state.session_id,
+                            config.ALLOWED_IMAGE_EXTENSIONS,
+                        )
+                    except ValueError as e:
+                        st.error(f"「{uploaded_file.name}」を保存できません: {e}")
+                        continue
+                    with open(dest_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                    st.session_state.upload_cache[upload_key] = str(dest_path)
                 saved_paths.append(dest_path)
                 saved_names.append(uploaded_file.name)
 
@@ -394,7 +409,9 @@ def main():
             st.session_state.uploaded_image_names = saved_names
 
             st.markdown("<br>", unsafe_allow_html=True)
-            if st.button("次へ進む（STEP 2: AI解析へ） ▶", type="primary", use_container_width=True):
+            if st.button("次へ進む（STEP 2: AI解析へ） ▶", type="primary", use_container_width=True, disabled=not saved_paths):
+                st.session_state.is_mock = False
+                st.session_state.analysis_error = None
                 st.session_state.current_step = 2
                 st.rerun()
 
@@ -409,7 +426,9 @@ def main():
         cols = st.columns(min(len(st.session_state.uploaded_image_paths), 4))
         for idx, img_p in enumerate(st.session_state.uploaded_image_paths):
             with cols[idx % 4]:
-                st.image(str(img_p), caption=f"板書 {idx+1}: {Path(img_p).name}", use_container_width=True)
+                display_names = st.session_state.uploaded_image_names
+                disp = display_names[idx] if idx < len(display_names) else Path(img_p).name
+                st.image(str(img_p), caption=f"板書 {idx+1}: {disp}", use_container_width=True)
 
         teacher_instruction = st.text_area(
             "教員からの補足指示（任意）",
@@ -426,41 +445,73 @@ def main():
                 st.rerun()
 
         if start_analysis:
-            with st.spinner("Vision AI が板書の構造・数式・教育的意図を解析中... (少々お待ちください)"):
-                # Call Vision AI
-                vision_result = vision_analyzer.analyze_board_images(
+            with st.status("Vision AI が板書を読み取っています…（画像の読み込み中）", expanded=False) as status_box:
+                # 新しい解析を開始するので、デモ状態と前回エラーをリセット
+                st.session_state.is_mock = False
+                st.session_state.analysis_error = None
+                t_start = time.time()
+                last_update = [0.0]
+                phase_label = ["① 板書を書き起こしています"]
+
+                def _phase(phase: str, message: str):
+                    phase_label[0] = "① 板書を書き起こしています" if phase == "transcribe" else "② 授業の構成を整理しています"
+                    status_box.update(label=f"{phase_label[0]}…（{time.time() - t_start:.0f} 秒経過）")
+                    st.write(f"{phase_label[0]}（開始 {time.time() - t_start:.0f} 秒）")
+
+                def _progress(_delta: str, chars: int):
+                    now = time.time()
+                    if now - last_update[0] >= 1.0:  # 1秒ごとに進捗表示を更新
+                        last_update[0] = now
+                        status_box.update(label=f"{phase_label[0]}… {chars} 文字（{now - t_start:.0f} 秒経過）")
+
+                # 書き起こし → 構成の整理（失敗時にモック授業へ自動差し替えはしない）
+                lesson, analysis_err, vision_result = analyze_and_parse(
+                    vision_analyzer=vision_analyzer,
                     image_paths=st.session_state.uploaded_image_paths,
+                    image_names=st.session_state.uploaded_image_names,
                     custom_instructions=teacher_instruction,
-                    model_override=st.session_state.ollama_model,
+                    model_override=st.session_state.llm_model or vision_analyzer.model,
+                    on_progress=_progress,
+                    on_phase=_phase,
                 )
                 st.session_state.raw_vision_result = vision_result
+                status_box.update(
+                    label=f"解析処理が終了しました（{time.time() - t_start:.0f} 秒 / "
+                    f"{(vision_result or {}).get('device', '?').upper()}）",
+                    state="complete" if lesson else "error",
+                )
 
-                # Check if Ollama succeeded or if we should fallback/simulate
-                parser = LessonParser()
-                lesson = None
-                parse_err = None
-
-                if vision_result.get("success") and vision_result.get("raw_text"):
-                    lesson, parse_err = parser.parse_to_lesson(
-                        raw_llm_text=vision_result["raw_text"],
-                        source_images=st.session_state.uploaded_image_names,
-                        vision_analyzer=vision_analyzer,
-                    )
-
-                # Fallback Simulation if Ollama vision model not available
-                if not lesson:
-                    first_img_name = st.session_state.uploaded_image_names[0] if st.session_state.uploaded_image_names else "board.png"
-                    logger.info("Using high-fidelity educational simulation fallback for testing...")
-                    lesson = get_mock_lesson_for_sample(first_img_name)
-                    lesson.source_images = st.session_state.uploaded_image_names
-                    if parse_err:
-                        st.warning(f"⚠️ AI解析の警告: {parse_err}\n（シミュレーション・高精度テンプレート構造を適用しました）")
-                    else:
-                        st.info("ℹ️ ローカルOllamaモデルからの応答待機またはモックモードで授業構造を抽出しました。")
-
-                st.session_state.parsed_lesson = lesson
+            if lesson:
+                set_lesson(lesson)
                 st.success("✅ 板書解析と授業構造化が完了しました！")
                 time.sleep(0.5)
+                st.session_state.current_step = 3
+                st.rerun()
+            else:
+                logger.warning(f"Board analysis failed: {analysis_err}")
+                st.session_state.analysis_error = {
+                    "message": analysis_err,
+                    "raw_text": vision_result.get("raw_text", "") if vision_result else "",
+                }
+
+        # 解析失敗時: エラー内容・生出力を表示し、STEP2に留まる（再試行可能）
+        if st.session_state.analysis_error:
+            err_info = st.session_state.analysis_error
+            st.error(f"❌ 板書のAI解析に失敗しました。\n\n{err_info.get('message')}\n\nモデル・接続設定を確認して再試行してください。")
+            with st.expander("🔎 LLMの生出力（デバッグ用）", expanded=False):
+                if err_info.get("raw_text"):
+                    st.code(err_info["raw_text"], language="text")
+                else:
+                    st.caption("（生出力はありません）")
+
+            st.caption("※ 以下はOllamaが使えない環境での動作確認用です。アップロード画像の解析結果ではありません。")
+            if st.button("デモ用サンプル授業で続行（解析結果ではありません）", use_container_width=True):
+                first_img_name = st.session_state.uploaded_image_names[0] if st.session_state.uploaded_image_names else "board.png"
+                mock_lesson = get_mock_lesson_for_sample(first_img_name)
+                mock_lesson.source_images = st.session_state.uploaded_image_names
+                set_lesson(mock_lesson)
+                st.session_state.is_mock = True
+                st.session_state.analysis_error = None
                 st.session_state.current_step = 3
                 st.rerun()
 
@@ -478,6 +529,20 @@ def main():
                 st.session_state.current_step = 2
                 st.rerun()
             return
+
+        # AIが読み取れなかった・推測できなかった項目（要確認）を先に示す
+        review_items = list((st.session_state.get("raw_vision_result") or {}).get("parse_warnings") or [])
+        review_items += [f"「{loc}」が要確認になっています。" for loc in find_unconfirmed_fields(lesson)]
+        if review_items:
+            st.warning("⚠️ **確認が必要な項目があります**（板書と照らし合わせて修正してください）\n\n"
+                       + "\n".join(f"- {w}" for w in dict.fromkeys(review_items)))
+        raw_info = st.session_state.get("raw_vision_result") or {}
+        if raw_info.get("elapsed_seconds"):
+            st.caption(f"AI解析: {raw_info.get('model')}（{str(raw_info.get('device', '?')).upper()}）"
+                       f" {raw_info['elapsed_seconds']:.0f} 秒")
+
+        # 入力欄のキーに授業データのハッシュを含める（別の授業を読み込んだとき前の入力値が残らないように）
+        kp = f"{lesson_fingerprint(lesson)}_"
 
         with st.form("edit_lesson_form"):
             st.markdown("### 📋 基本情報")
@@ -506,16 +571,14 @@ def main():
                 st.markdown(f"#### セクション {idx+1}: {sec.title} ({sec.section_type})")
                 sec_c1, sec_c2 = st.columns([3, 1])
                 with sec_c1:
-                    s_title = st.text_input(f"見出し", value=sec.title, key=f"sec_title_{idx}")
-                    s_content = st.text_area(f"本文・解説", value=sec.content, key=f"sec_content_{idx}", height=100)
+                    s_title = st.text_input(f"見出し", value=sec.title, key=kp + f"sec_title_{idx}")
+                    s_content = st.text_area(f"本文・解説", value=sec.content, key=kp + f"sec_content_{idx}", height=100)
                 with sec_c2:
                     s_type = st.selectbox(
                         "種類",
-                        options=["introduction", "concept", "definition", "formula", "example", "exercise", "summary"],
-                        index=["introduction", "concept", "definition", "formula", "example", "exercise", "summary"].index(
-                            sec.section_type if sec.section_type in ["introduction", "concept", "definition", "formula", "example", "exercise", "summary"] else "concept"
-                        ),
-                        key=f"sec_type_{idx}",
+                        options=SECTION_TYPE_OPTIONS,
+                        index=SECTION_TYPE_OPTIONS.index(sec.section_type) if sec.section_type in SECTION_TYPE_OPTIONS else 1,
+                        key=kp + f"sec_type_{idx}",
                     )
 
                 # Formulas inside section
@@ -526,12 +589,12 @@ def main():
                         f_latex = st.text_input(
                             f"LaTeX式 #{f_idx+1}",
                             value=f.latex,
-                            key=f"f_latex_{idx}_{f_idx}",
+                            key=kp + f"f_latex_{idx}_{f_idx}",
                         )
                         f_desc = st.text_input(
                             f"説明 #{f_idx+1}",
                             value=f.description or "",
-                            key=f"f_desc_{idx}_{f_idx}",
+                            key=kp + f"f_desc_{idx}_{f_idx}",
                         )
                         edited_formulas.append(
                             Formula(
@@ -548,35 +611,42 @@ def main():
                 edited_example = sec.example
                 if sec.example:
                     with st.expander(f"例題の詳細設定: {sec.example.title}", expanded=True):
-                        ex_prob = st.text_area("問題文", value=sec.example.problem, key=f"ex_prob_{idx}")
-                        ex_app = st.text_input("考え方・ヒント", value=sec.example.approach or "", key=f"ex_app_{idx}")
+                        ex_prob = st.text_area("問題文", value=sec.example.problem, key=kp + f"ex_prob_{idx}")
+                        ex_app = st.text_input("考え方・ヒント", value=sec.example.approach or "", key=kp + f"ex_app_{idx}")
                         ex_steps_str = st.text_area(
                             "解法ステップ（1行1ステップ）",
                             value="\n".join(sec.example.solution_steps),
-                            key=f"ex_steps_{idx}",
+                            key=kp + f"ex_steps_{idx}",
                         )
-                        ex_ans = st.text_input("答え", value=sec.example.answer, key=f"ex_ans_{idx}")
-                        edited_example = ExampleProblem(
-                            title=sec.example.title,
-                            problem=ex_prob,
-                            approach=ex_app,
-                            solution_steps=[s for s in ex_steps_str.split("\n") if s.strip()],
-                            answer=ex_ans,
-                        )
+                        ex_ans = st.text_input("答え", value=sec.example.answer, key=kp + f"ex_ans_{idx}")
+                        ex_notes = st.text_input("指導のポイント", value=sec.example.teaching_notes or "", key=kp + f"ex_notes_{idx}")
+                        # 編集項目以外（例題内の数式など）は元の値を引き継ぐ
+                        edited_example = sec.example.model_copy(update={
+                            "problem": ex_prob,
+                            "approach": ex_app or None,
+                            "solution_steps": [s for s in ex_steps_str.split("\n") if s.strip()],
+                            "answer": ex_ans,
+                            "teaching_notes": ex_notes or None,
+                        })
 
                 # Exercise
                 edited_exercise = sec.exercise
                 if sec.exercise:
                     with st.expander(f"練習問題の詳細設定: {sec.exercise.title}", expanded=True):
-                        exe_prob = st.text_area("問題文", value=sec.exercise.problem, key=f"exe_prob_{idx}")
-                        exe_hint = st.text_input("ヒント", value=sec.exercise.hint or "", key=f"exe_hint_{idx}")
-                        exe_ans = st.text_input("解答", value=sec.exercise.answer or "", key=f"exe_ans_{idx}")
-                        edited_exercise = Exercise(
-                            title=sec.exercise.title,
-                            problem=exe_prob,
-                            hint=exe_hint,
-                            answer=exe_ans,
+                        exe_prob = st.text_area("問題文", value=sec.exercise.problem, key=kp + f"exe_prob_{idx}")
+                        exe_hint = st.text_input("ヒント", value=sec.exercise.hint or "", key=kp + f"exe_hint_{idx}")
+                        exe_ans = st.text_input("解答", value=sec.exercise.answer or "", key=kp + f"exe_ans_{idx}")
+                        exe_steps_str = st.text_area(
+                            "解答の手順（1行1ステップ）",
+                            value="\n".join(sec.exercise.solution_steps),
+                            key=kp + f"exe_steps_{idx}",
                         )
+                        edited_exercise = sec.exercise.model_copy(update={
+                            "problem": exe_prob,
+                            "hint": exe_hint or None,
+                            "answer": exe_ans or None,
+                            "solution_steps": [s for s in exe_steps_str.split("\n") if s.strip()],
+                        })
 
                 edited_sections.append(
                     Section(
@@ -613,7 +683,7 @@ def main():
                     source_images=st.session_state.uploaded_image_names,
                     visual_structure=lesson.visual_structure,
                 )
-                st.session_state.parsed_lesson = updated_lesson
+                set_lesson(updated_lesson)
                 st.session_state.current_step = 4
                 st.rerun()
 
@@ -635,8 +705,8 @@ def main():
                 f"""
                 <div class="content-card">
                     <h3>📚 生成対象授業</h3>
-                    <p><b>教科・単元:</b> {lesson.subject} | {lesson.unit}</p>
-                    <p><b>授業テーマ:</b> {lesson.lesson_title}</p>
+                    <p><b>教科・単元:</b> {html.escape(lesson.subject)} | {html.escape(lesson.unit)}</p>
+                    <p><b>授業テーマ:</b> {html.escape(lesson.lesson_title)}</p>
                     <p><b>スライド予定数:</b> {len(lesson.sections) + 2} 枚（タイトル・セクション・まとめ）</p>
                 </div>
                 """,
@@ -678,7 +748,7 @@ def main():
                 with st.spinner("16:9 スライドおよびKaTeX数式テンプレートを生成中..."):
                     generator = ElectronicBoardGenerator(theme=st.session_state.theme)
                     presentation = generator.build_presentation(lesson)
-                    html_str = generator.render_presentation_html(presentation)
+                    html_str = generator.render_presentation_html(presentation, lesson=lesson)
 
                     # Save to outputs/
                     json_p, html_p = generator.save_outputs(
@@ -686,15 +756,20 @@ def main():
                         presentation=presentation,
                         html_content=html_str,
                         research_metadata={
-                            "model": st.session_state.ollama_model,
+                            "model": "mock" if st.session_state.is_mock else (st.session_state.llm_model or vision_analyzer.model),
+                            "backend": vision_analyzer.backend_name,
+                            "device": (st.session_state.get("raw_vision_result") or {}).get("device", "unknown"),
+                            "elapsed_seconds": (st.session_state.get("raw_vision_result") or {}).get("elapsed_seconds"),
                             "source_images": st.session_state.uploaded_image_names,
                         },
+                        is_mock=st.session_state.is_mock,
                     )
 
                     st.session_state.generated_presentation = presentation
                     st.session_state.presentation_html = html_str
                     st.session_state.saved_json_path = str(json_p)
                     st.session_state.saved_html_path = str(html_p)
+                    st.session_state.presentation_lesson_hash = lesson_fingerprint(lesson)
 
                     st.success(f"✅ 教材を生成・保存しました！（{json_p.name}）")
                     time.sleep(0.5)
@@ -714,6 +789,12 @@ def main():
 
         if not st.session_state.presentation_html:
             st.error("教材HTMLがありません。STEP 4 で生成してください。")
+            return
+        if st.session_state.presentation_lesson_hash != lesson_fingerprint(st.session_state.parsed_lesson):
+            st.warning("授業データが変更されたため、表示中の教材は古い内容です。STEP 4 で再生成してください。")
+            if st.button("STEP 4 へ戻って再生成する", type="primary"):
+                st.session_state.current_step = 4
+                st.rerun()
             return
 
         col_top1, col_top2 = st.columns([2, 1])
@@ -765,8 +846,11 @@ def main():
                 st.session_state.current_step = 1
                 st.session_state.uploaded_image_paths = []
                 st.session_state.uploaded_image_names = []
-                st.session_state.parsed_lesson = None
-                st.session_state.presentation_html = None
+                set_lesson(None)
+                reset_derived_state()
+                st.session_state.raw_vision_result = None
+                st.session_state.is_mock = False
+                st.session_state.analysis_error = None
                 st.rerun()
 
 

@@ -2,6 +2,7 @@
 Generator module for creating 16:9 electronic blackboard presentation materials from structured Lesson data.
 """
 
+import html
 import json
 import logging
 import uuid
@@ -9,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 
-from jinja2 import Template
+from jinja2 import Environment
 
 import config
 from models.schemas import (
@@ -23,6 +24,14 @@ from models.schemas import (
 )
 
 logger = logging.getLogger("ai_e_board.generator")
+
+
+def _e(value: Any) -> str:
+    """HTML-escape LLM/teacher-derived text before embedding it into generated HTML.
+    KaTeX auto-render reads textContent, so escaped math (e.g. $a&lt;b$) still renders correctly."""
+    if value is None:
+        return ""
+    return html.escape(str(value), quote=True)
 
 
 HTML_PRESENTATION_TEMPLATE = """<!DOCTYPE html>
@@ -541,7 +550,8 @@ class ElectronicBoardGenerator:
 
     def __init__(self, theme: str = config.DEFAULT_THEME):
         self.theme = theme
-        self.template = Template(HTML_PRESENTATION_TEMPLATE)
+        # autoescape=True: template variables are escaped; slide.content_html is pre-escaped via _e() and marked |safe
+        self.template = Environment(autoescape=True).from_string(HTML_PRESENTATION_TEMPLATE)
 
     def generate_slides_from_lesson(self, lesson: Lesson) -> List[Slide]:
         """Convert a Lesson model into an ordered list of 16:9 slides."""
@@ -550,7 +560,7 @@ class ElectronicBoardGenerator:
 
         # 1. Slide: Lesson Title & Objectives
         obj_items = "".join(
-            f'<div class="objective-item"><span class="objective-icon">🎯</span><span>{obj}</span></div>'
+            f'<div class="objective-item"><span class="objective-icon">🎯</span><span>{_e(obj)}</span></div>'
             for obj in lesson.learning_objectives
         )
         if not obj_items:
@@ -558,7 +568,7 @@ class ElectronicBoardGenerator:
 
         intro_text = ""
         if lesson.introduction:
-            intro_text = f'<p style="margin-top: 18px; font-size: 1.6rem; color: var(--text-sub);">{lesson.introduction}</p>'
+            intro_text = f'<p style="margin-top: 18px; font-size: 1.6rem; color: var(--text-sub);">{_e(lesson.introduction)}</p>'
 
         slides.append(
             Slide(
@@ -586,7 +596,7 @@ class ElectronicBoardGenerator:
             # Visual annotations tag
             if sec.visual_annotations:
                 tags = "".join(
-                    f'<span class="visual-note-tag">📌 {va.target_text} ({va.note or va.element_type})</span>'
+                    f'<span class="visual-note-tag">📌 {_e(va.target_text)} ({_e(va.note or va.element_type)})</span>'
                     for va in sec.visual_annotations
                 )
                 content_html_parts.append(f'<div style="margin-bottom: 14px;">{tags}</div>')
@@ -594,7 +604,7 @@ class ElectronicBoardGenerator:
             # Main narrative content
             if sec.content:
                 content_html_parts.append(
-                    f'<p style="font-size: 1.8rem; margin-bottom: 20px; line-height: 1.7;">{sec.content}</p>'
+                    f'<p style="font-size: 1.8rem; margin-bottom: 20px; line-height: 1.7;">{_e(sec.content)}</p>'
                 )
 
             # Formulas
@@ -602,8 +612,8 @@ class ElectronicBoardGenerator:
                 content_html_parts.append(
                     f"""
                     <div class="formula-highlight">
-                        $${form.latex}$$
-                        {f'<div class="formula-desc">{form.description}</div>' if form.description else ''}
+                        $${_e(form.latex)}$$
+                        {f'<div class="formula-desc">{_e(form.description)}</div>' if form.description else ''}
                     </div>
                     """
                 )
@@ -612,21 +622,21 @@ class ElectronicBoardGenerator:
             if sec.example:
                 ex = sec.example
                 steps_html = "".join(
-                    f'<li class="step-item">{st}</li>' for st in ex.solution_steps
+                    f'<li class="step-item">{_e(st)}</li>' for st in ex.solution_steps
                 )
                 approach_html = (
-                    f'<div style="color: var(--chalk-yellow); font-size: 1.5rem; margin-bottom: 10px;">💡 <b>考え方:</b> {ex.approach}</div>'
+                    f'<div style="color: var(--chalk-yellow); font-size: 1.5rem; margin-bottom: 10px;">💡 <b>考え方:</b> {_e(ex.approach)}</div>'
                     if ex.approach
                     else ""
                 )
                 content_html_parts.append(
                     f"""
                     <div class="problem-card">
-                        <div class="problem-header">📝 {ex.title}</div>
-                        <div class="problem-text">{ex.problem}</div>
+                        <div class="problem-header">📝 {_e(ex.title)}</div>
+                        <div class="problem-text">{_e(ex.problem)}</div>
                         {approach_html}
                         {f'<div style="font-size: 1.5rem; font-weight: bold; margin-top: 10px;">【解法】</div><ol class="step-list">{steps_html}</ol>' if steps_html else ''}
-                        <div class="answer-box">答: {ex.answer}</div>
+                        <div class="answer-box">答: {_e(ex.answer)}</div>
                     </div>
                     """
                 )
@@ -635,20 +645,20 @@ class ElectronicBoardGenerator:
             if sec.exercise:
                 exe = sec.exercise
                 hint_html = (
-                    f'<div style="color: var(--chalk-blue); font-size: 1.4rem; margin-top: 10px;">💬 <b>ヒント:</b> {exe.hint}</div>'
+                    f'<div style="color: var(--chalk-blue); font-size: 1.4rem; margin-top: 10px;">💬 <b>ヒント:</b> {_e(exe.hint)}</div>'
                     if exe.hint
                     else ""
                 )
                 ans_html = (
-                    f'<div class="answer-box" style="font-size: 1.7rem;">解答: {exe.answer}</div>'
+                    f'<div class="answer-box" style="font-size: 1.7rem;">解答: {_e(exe.answer)}</div>'
                     if exe.answer and exe.answer != "要確認/未記載"
                     else '<div style="margin-top: 14px; font-size: 1.4rem; color: var(--text-sub);">※ 解答はノートに記入しましょう</div>'
                 )
                 content_html_parts.append(
                     f"""
                     <div class="problem-card" style="border-color: var(--chalk-blue);">
-                        <div class="problem-header" style="color: var(--chalk-yellow);">✏️ {exe.title}</div>
-                        <div class="problem-text">{exe.problem}</div>
+                        <div class="problem-header" style="color: var(--chalk-yellow);">✏️ {_e(exe.title)}</div>
+                        <div class="problem-text">{_e(exe.problem)}</div>
                         {hint_html}
                         {ans_html}
                     </div>
@@ -669,7 +679,8 @@ class ElectronicBoardGenerator:
                 Slide(
                     slide_number=slide_num,
                     total_slides=0,
-                    slide_type=sec.section_type if sec.section_type in ["title", "objective", "intro", "concept", "formula", "example", "exercise", "summary"] else "concept",
+                    slide_type={"introduction": "intro", "formula": "formula", "example": "example",
+                                "exercise": "exercise", "summary": "summary"}.get(sec.section_type, "concept"),
                     badge=badge_label,
                     title=sec.title,
                     content_html="".join(content_html_parts),
@@ -690,10 +701,10 @@ class ElectronicBoardGenerator:
                     content_html=f"""
                     <div class="objective-box" style="border-color: var(--chalk-pink); background: rgba(243, 129, 129, 0.12);">
                         <div style="font-size: 2.0rem; font-weight: 700; line-height: 1.8;">
-                            {lesson.summary}
+                            {_e(lesson.summary)}
                         </div>
                     </div>
-                    {f'<div style="margin-top: 20px; font-size: 1.4rem; color: var(--text-sub);">📌 <b>指導メモ:</b> {lesson.notes_for_teacher}</div>' if lesson.notes_for_teacher else ''}
+                    {f'<div style="margin-top: 20px; font-size: 1.4rem; color: var(--text-sub);">📌 <b>指導メモ:</b> {_e(lesson.notes_for_teacher)}</div>' if lesson.notes_for_teacher else ''}
                     """,
                     speaker_notes="授業全体の重要事項を振り返り、次回の授業につなげます。",
                 )
@@ -721,9 +732,20 @@ class ElectronicBoardGenerator:
             created_at=datetime.now().isoformat(),
         )
 
-    def render_presentation_html(self, presentation: ElectronicBoardPresentation) -> str:
-        """Render standalone HTML string from presentation model."""
-        return self.template.render(presentation=presentation)
+    def render_presentation_html(self, presentation: ElectronicBoardPresentation, lesson: Optional[Lesson] = None) -> str:
+        """
+        Render standalone HTML string from presentation model. When the lesson is given, it is embedded as
+        machine-readable JSON (<script type="application/json" id="lesson-data">) so that System B evaluates
+        an exported HTML exactly like the lesson itself.
+        """
+        html_out = self.template.render(presentation=presentation)
+        if lesson is None:
+            return html_out
+        payload = json.dumps(lesson.model_dump(), ensure_ascii=False)
+        payload = payload.replace("<", "\\u003c")  # valid JSON escape; the text can never close the <script>
+
+        block = f'<script type="application/json" id="lesson-data">{payload}</script>\n'
+        return html_out.replace("</body>", block + "</body>", 1)
 
     def save_outputs(
         self,
@@ -731,9 +753,12 @@ class ElectronicBoardGenerator:
         presentation: ElectronicBoardPresentation,
         html_content: str,
         research_metadata: Optional[Dict[str, Any]] = None,
+        is_mock: bool = False,
     ) -> Tuple[Path, Path]:
         """
         Save JSON and HTML files to outputs/ directory, and record research log.
+        is_mock=True marks outputs built from the demo sample lesson (not a real model run);
+        the research log then records model="mock".
         Returns (json_path, html_path).
         """
         base_name = presentation.lesson_id
@@ -744,6 +769,7 @@ class ElectronicBoardGenerator:
         full_export = {
             "lesson": lesson.model_dump(),
             "presentation": presentation.model_dump(),
+            "is_mock": bool(is_mock),
         }
         with open(json_path, "w", encoding="utf-8") as jf:
             json.dump(full_export, jf, ensure_ascii=False, indent=2)
@@ -761,7 +787,10 @@ class ElectronicBoardGenerator:
                 "unit": lesson.unit,
                 "slides_count": len(presentation.slides),
                 **research_metadata,
+                "is_mock": bool(is_mock),
             }
+            if is_mock:
+                log_entry["model"] = "mock"
             try:
                 with open(config.RESEARCH_LOG_PATH, "a", encoding="utf-8") as log_file:
                     log_file.write(json.dumps(log_entry, ensure_ascii=False) + "\n")

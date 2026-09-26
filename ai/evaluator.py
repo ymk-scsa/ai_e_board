@@ -3,14 +3,13 @@ Evaluator module providing extensible interfaces for pedagogical quality assessm
 curriculum alignment check, and instructional feedback (Future expansion hooks).
 """
 
-import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 from pathlib import Path
 
-import config
 from models.schemas import Lesson, ElectronicBoardPresentation
+from system_b.curriculum import describe, match_unit
 
 logger = logging.getLogger("ai_e_board.evaluator")
 
@@ -28,39 +27,22 @@ class CurriculumAlignmentEvaluator(BaseLessonEvaluator):
     """Evaluates alignment between lesson content and Course of Study (学習指導要領) database."""
 
     def __init__(self, curriculum_data_path: Optional[Path] = None):
-        self.curriculum_path = curriculum_data_path or (config.CURRICULUM_DIR / "high_school_math_stub.json")
-        self.curriculum_db = self._load_curriculum_db()
-
-    def _load_curriculum_db(self) -> Dict[str, Any]:
-        if self.curriculum_path.exists():
-            try:
-                with open(self.curriculum_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.warning(f"Failed to load curriculum DB: {e}")
-        return {}
+        self.curriculum_path = curriculum_data_path  # None → data/curriculum/high_school_math_stub.json
 
     def evaluate(self, lesson: Lesson, presentation: Optional[ElectronicBoardPresentation] = None) -> Dict[str, Any]:
-        """Check if unit and key formulas match curriculum standards (Stub implementation for Phase 1)."""
-        matched_subjects = []
-        curriculum_found = False
-
-        for subject_info in self.curriculum_db.get("subjects", []):
-            for unit in subject_info.get("units", []):
-                if unit["unit_name"] in lesson.unit or lesson.unit in unit["unit_name"]:
-                    matched_subjects.append({
-                        "subject": subject_info["subject_name"],
-                        "unit": unit["unit_name"],
-                        "recommended_topics": unit.get("topics", []),
-                        "standard_formulas": unit.get("key_formulas", []),
-                    })
-                    curriculum_found = True
-
+        """Match the lesson's unit / title against the bundled Course of Study data (system_b/curriculum.py)."""
+        matches = match_unit(lesson.unit, lesson.lesson_title, self.curriculum_path)
+        matched_subjects = [
+            {"subject": m.subject, "unit": m.unit, "recommended_topics": m.topics, "standard_formulas": m.key_formulas}
+            for m in matches
+        ]
+        curriculum_found = bool(matches)
         return {
             "evaluation_type": "curriculum_alignment",
             "is_aligned": curriculum_found,
             "matched_curriculum_entries": matched_subjects,
-            "status": "整合性確認完了" if curriculum_found else "学習指導要領データベース照合（要拡張）",
+            "message": describe(matches, lesson.unit),
+            "status": "整合性確認完了" if curriculum_found else "該当単元なし（収録範囲外または単元名未確定）",
             "future_extensions": [
                 "学習指導要領コード（Guideline Code）との自動マッピング",
                 "単元内における既習事項・未習事項の依存関係グラフ解析",
@@ -76,7 +58,7 @@ class PedagogicalQualityEvaluator(BaseLessonEvaluator):
         has_objectives = len(lesson.learning_objectives) > 0
         has_examples = any(s.example is not None for s in lesson.sections)
         has_exercises = any(s.exercise is not None for s in lesson.sections)
-        has_summary = lesson.summary is not None
+        has_summary = bool(lesson.summary and lesson.summary.strip())
 
         score = 0
         if has_objectives: score += 25

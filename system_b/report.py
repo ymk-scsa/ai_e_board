@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 from datetime import datetime
 from typing import Tuple, Optional, Dict, Any
-from jinja2 import Template
+from jinja2 import Environment
 
 import config
 from models.evaluation_schemas import EvaluationResult
@@ -467,7 +467,8 @@ class ReportGenerator:
     """Generates standalone HTML evaluation reports and structured JSON files."""
 
     def __init__(self):
-        self.template = Template(HTML_REPORT_TEMPLATE)
+        # autoescape=True: LLM/教材由来のテキストはすべてHTMLエスケープされる（テンプレート内に事前生成HTMLは無い）
+        self.template = Environment(autoescape=True).from_string(HTML_REPORT_TEMPLATE)
 
     def render_html_report(self, result: EvaluationResult) -> str:
         """Render complete HTML report from EvaluationResult."""

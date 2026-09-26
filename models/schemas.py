@@ -2,6 +2,8 @@
 Data schemas for educational structure extraction and electronic blackboard generation.
 """
 
+import hashlib
+import json
 from typing import List, Optional, Literal, Dict, Any
 from pydantic import BaseModel, Field
 
@@ -91,6 +93,14 @@ class Lesson(BaseModel):
     visual_structure: Optional[VisualStructure] = Field(None, description="Visual layout and annotation details")
     source_images: List[str] = Field(default_factory=list, description="Filenames of source board plan images")
     notes_for_teacher: Optional[str] = Field(None, description="Pedagogical hints or cautionary notes for the teacher")
+
+
+def lesson_fingerprint(lesson: Optional["Lesson"]) -> Optional[str]:
+    """Stable content hash of a Lesson. Used to tie derived artifacts (slides, evaluations) to their source."""
+    if lesson is None:
+        return None
+    payload = json.dumps(lesson.model_dump(), ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 class Slide(BaseModel):

@@ -4,6 +4,7 @@ Parses Lesson JSON models, raw JSON dicts, or standalone Electronic Blackboard H
 and computes objective quantitative metrics (character count, formula count, attention flags).
 """
 
+import html
 import json
 import logging
 import re
@@ -49,84 +50,40 @@ class MaterialAnalyzer:
     """Extracts instructional content and quantitative metrics from Lesson JSON or HTML."""
 
     @classmethod
-    def parse_from_lesson(cls, lesson: Lesson, presentation: Optional[ElectronicBoardPresentation] = None) -> ParsedLessonMaterial:
-        """Parse structured Lesson schema (and optional presentation) into ParsedLessonMaterial."""
-        slides: List[ParsedSlideContent] = []
+    def parse_from_lesson(
+        cls,
+        lesson: Lesson,
+        presentation: Optional[ElectronicBoardPresentation] = None,
+        source_type: str = "lesson_json",
+    ) -> ParsedLessonMaterial:
+        """
+        Parse a Lesson into ParsedLessonMaterial. Slides always come from System A's generator
+        (the given presentation, or one built from the lesson), so a lesson scores the same whether it
+        arrives as a Lesson, an exported JSON, or an exported HTML.
+        """
+        if not presentation or not presentation.slides:
+            from ai.generator import ElectronicBoardGenerator  # local import: ai ↔ system_b packages
+            presentation = ElectronicBoardGenerator().build_presentation(lesson)
 
-        # If presentation is already built, use its slides
-        if presentation and presentation.slides:
-            for s in presentation.slides:
-                body_clean, formulas = cls._extract_text_and_formulas(s.content_html)
-                slides.append(
-                    ParsedSlideContent(
-                        slide_number=s.slide_number,
-                        badge=s.badge,
-                        title=s.title,
-                        body_text=body_clean,
-                        raw_html=s.content_html,
-                        formulas=formulas,
-                        has_example="例題" in s.badge or "例題" in s.title or "problem-card" in s.content_html,
-                        has_exercise="練習" in s.badge or "問" in s.title,
-                        speaker_notes=s.speaker_notes,
-                    )
-                )
-        else:
-            # Reconstruct from Lesson sections
-            slide_idx = 1
-            # 1. Title & Objectives Slide
-            obj_text = "\n".join(lesson.learning_objectives)
+        slides: List[ParsedSlideContent] = []
+        for s in presentation.slides:
+            body_clean, formulas = cls._extract_text_and_formulas(s.content_html)
             slides.append(
                 ParsedSlideContent(
-                    slide_number=slide_idx,
-                    badge="本時の目標",
-                    title=lesson.lesson_title,
-                    body_text=f"【本時の目標】\n{obj_text}\n{lesson.introduction or ''}",
-                    raw_html=f"<div>{obj_text}</div>",
-                    formulas=[],
-                    has_example=False,
-                    has_exercise=False,
+                    slide_number=s.slide_number,
+                    badge=s.badge,
+                    title=s.title,
+                    body_text=body_clean,
+                    raw_html=s.content_html,
+                    formulas=formulas,
+                    has_example=s.slide_type == "example" or (s.slide_type == "intro" and "problem-card" in s.content_html),
+                    has_exercise=s.slide_type == "exercise",
+                    speaker_notes=s.speaker_notes,
                 )
             )
-            slide_idx += 1
-
-            for sec in lesson.sections:
-                sec_formulas = [f.latex for f in sec.formulas]
-                sec_text = sec.content
-                if sec.example:
-                    sec_text += f"\n【例題】{sec.example.problem} 解法: {' '.join(sec.example.solution_steps)} 答: {sec.example.answer}"
-                if sec.exercise:
-                    sec_text += f"\n【練習】{sec.exercise.problem} 解答: {sec.exercise.answer or ''}"
-
-                slides.append(
-                    ParsedSlideContent(
-                        slide_number=slide_idx,
-                        badge=sec.section_type,
-                        title=sec.title,
-                        body_text=sec_text,
-                        raw_html="",
-                        formulas=sec_formulas,
-                        has_example=sec.example is not None,
-                        has_exercise=sec.exercise is not None,
-                    )
-                )
-                slide_idx += 1
-
-            if lesson.summary:
-                slides.append(
-                    ParsedSlideContent(
-                        slide_number=slide_idx,
-                        badge="まとめ",
-                        title="本時のまとめ",
-                        body_text=lesson.summary,
-                        raw_html="",
-                        formulas=[],
-                        has_example=False,
-                        has_exercise=False,
-                    )
-                )
 
         return ParsedLessonMaterial(
-            source_type="lesson_json",
+            source_type=source_type,
             lesson_title=lesson.lesson_title,
             subject=lesson.subject,
             unit=lesson.unit,
@@ -140,13 +97,25 @@ class MaterialAnalyzer:
 
     @classmethod
     def parse_from_html(cls, html_content: str) -> ParsedLessonMaterial:
-        """Parse standalone Electronic Blackboard HTML into ParsedLessonMaterial."""
+        """
+        Parse standalone Electronic Blackboard HTML into ParsedLessonMaterial.
+        HTML exported by System A embeds the lesson as JSON; it is used when present so that the HTML is
+        evaluated exactly like the lesson. Other HTML is scraped from the slide markup.
+        """
         soup = BeautifulSoup(html_content, "html.parser")
 
-        # Extract title and unit from header/meta
+        data_tag = soup.find("script", id="lesson-data")
+        if data_tag and data_tag.string:
+            try:
+                lesson = Lesson.model_validate(json.loads(data_tag.string))
+                return cls.parse_from_lesson(lesson, source_type="blackboard_html")
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Embedded lesson data is invalid; falling back to HTML scraping: {e}")
+
+        # Extract title and unit from header/meta ("<title>{lesson title} - AI電子黒板教材</title>")
         title_tag = soup.find("title")
         page_title = title_tag.get_text(strip=True) if title_tag else "電子黒板教材"
-        lesson_title = page_title.split("-")[0].strip()
+        lesson_title = re.sub(r"\s+-\s+AI電子黒板.*$", "", page_title).strip() or page_title
 
         meta_div = soup.find("div", class_="lesson-meta")
         subject = "数学"
@@ -182,14 +151,20 @@ class MaterialAnalyzer:
             body_html = str(body_div) if body_div else ""
             body_clean, formulas = cls._extract_text_and_formulas(body_html)
 
-            # Check if this slide has objectives or summary
+            # Objectives / introduction live on the first slide, the summary on the まとめ slide
             if "目標" in badge or idx == 1:
-                obj_items = s_div.find_all("div", class_="objective-item")
-                for oi in obj_items:
+                for oi in s_div.find_all("div", class_="objective-item"):
+                    icon = oi.find("span", class_="objective-icon")
+                    if icon:
+                        icon.extract()  # drop the 🎯 marker
                     objectives.append(oi.get_text(strip=True))
+                intro_p = body_div.find("p") if body_div else None
+                if intro_p and intro_p.get_text(strip=True):
+                    intro = intro_p.get_text(" ", strip=True)
 
             if "まとめ" in badge or "まとめ" in title_text:
-                summary = body_clean
+                box = body_div.find("div", class_="objective-box") if body_div else None
+                summary = box.get_text(" ", strip=True) if box else body_clean  # teacher notes are outside the box
 
             slides.append(
                 ParsedSlideContent(
@@ -199,8 +174,8 @@ class MaterialAnalyzer:
                     body_text=body_clean,
                     raw_html=body_html,
                     formulas=formulas,
-                    has_example="例題" in badge or "例題" in title_text or "problem-card" in body_html,
-                    has_exercise="練習" in badge or "問" in title_text,
+                    has_example="例題" in badge or ("導入" in badge and "problem-card" in body_html),
+                    has_exercise="練習" in badge,
                 )
             )
 
@@ -225,7 +200,8 @@ class MaterialAnalyzer:
         # Find all formulas
         display_formulas = re.findall(r"\$\$(.*?)\$\$", html_str, re.DOTALL)
         inline_formulas = re.findall(r"(?<!\$)\$(?!\$)(.*?)(?<!\$)\$(?!\$)", html_str)
-        all_formulas = [f.strip() for f in display_formulas + inline_formulas if f.strip()]
+        # Generated HTML escapes math text (e.g. $a&lt;b$), so unescape entities in extracted formulas
+        all_formulas = [html.unescape(f).strip() for f in display_formulas + inline_formulas if f.strip()]
 
         # Clean HTML to plain text
         soup = BeautifulSoup(html_str, "html.parser")
@@ -241,14 +217,15 @@ class MaterialAnalyzer:
         """
         char_count = len(slide.body_text)
         formula_count = len(slide.formulas)
-        bullet_count = slide.body_text.count("・") + slide.body_text.count("- ") + slide.body_text.count("\n")
+        html_items = slide.raw_html.count("<li") + slide.raw_html.count("objective-item")
+        bullet_count = html_items if html_items else slide.body_text.count("\n") + slide.body_text.count("・")
 
-        # Determine qualitative density level based on combined characteristics
+        # Qualitative density: each level requires BOTH the text amount and the formula count to stay in range
         if char_count < 80 and formula_count <= 1:
             density_level = "Low"
         elif char_count <= 160 and formula_count <= 3:
             density_level = "Moderate"
-        elif char_count <= 260 or formula_count <= 5:
+        elif char_count <= 260 and formula_count <= 5:
             density_level = "High"
         else:
             density_level = "Dense"
@@ -270,7 +247,8 @@ class MaterialAnalyzer:
             formula_count=formula_count,
             bullet_count=bullet_count,
             has_problem=slide.has_example or slide.has_exercise,
-            has_solution="答" in slide.body_text or "解" in slide.body_text,
+            # a shown answer (answer box / "答:" / "解答:"), not any text containing 解 (理解, 解説, ...)
+            has_solution="answer-box" in slide.raw_html or bool(re.search(r"(?:^|[\s。])(?:答え?|解答)\s*[:：]", slide.body_text)),
             density_level=density_level,
             attention_flags=attention_flags,
         )

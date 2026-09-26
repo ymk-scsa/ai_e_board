@@ -3,93 +3,80 @@ Pedagogical Evaluation Module for System B.
 Evaluates instructional sequence, objective alignment, worked examples, and curriculum standards.
 """
 
-import json
 import logging
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
-
-import config
+from typing import Optional, Tuple
 
 from models.evaluation_schemas import PedagogicalEvaluation
 from system_b.analyzer import ParsedLessonMaterial
+from system_b.curriculum import describe, match_unit
 
 logger = logging.getLogger("ai_e_board.system_b.pedagogy")
+
+# Points per lesson component (sum = 100). No floor: a lesson missing everything scores 0.
+COMPONENT_POINTS = {
+    "objectives": 15,
+    "introduction": 15,
+    "explanation": 15,
+    "example": 20,
+    "exercise": 20,
+    "summary": 15,
+}
+_EXPLANATION_BADGES = ("ポイント", "定義", "公式", "解説")
 
 
 class PedagogyEvaluator:
     """Evaluates the educational structure, flow coherence, and curriculum alignment of lesson materials."""
 
     def __init__(self, curriculum_path: Optional[Path] = None):
-        self.curriculum_path = curriculum_path or (config.CURRICULUM_DIR / "high_school_math_stub.json")
-        self.curriculum_db = self._load_curriculum_db()
+        self.curriculum_path = curriculum_path  # None → bundled data/curriculum/high_school_math_stub.json
 
-    def _load_curriculum_db(self) -> Dict[str, Any]:
-        if self.curriculum_path and self.curriculum_path.exists():
-            try:
-                with open(self.curriculum_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception as e:
-                logger.warning(f"Failed to load curriculum DB: {e}")
-        return {}
-
-    def check_curriculum_match(self, unit_name: str, subject: str) -> Tuple[bool, Optional[str]]:
-        """Check if unit matches standard Course of Study curriculum entries."""
-        for subj in self.curriculum_db.get("subjects", []):
-            for u in subj.get("units", []):
-                if u["unit_name"] in unit_name or unit_name in u["unit_name"]:
-                    topics_str = "、".join(u.get("topics", []))
-                    return True, f"学習指導要領（{subj['subject_name']} / {u['unit_name']}）の標準指導内容（{topics_str}）と適合しています。"
-        return False, "高等学校学習指導要領データベースに類似単元が登録されています（文脈に応じた柔軟な展開が推奨されます）。"
+    def check_curriculum_match(self, unit_name: str, subject: str, lesson_title: str = "") -> Tuple[bool, str]:
+        """Check whether the unit matches the bundled Course of Study entries."""
+        matches = match_unit(unit_name, lesson_title, self.curriculum_path)
+        return bool(matches), describe(matches, unit_name)
 
     def evaluate(self, material: ParsedLessonMaterial) -> PedagogicalEvaluation:
         """
-        Evaluate lesson structure based on instructional components and pedagogical flow.
-        Calculates structure score and provides contextual pedagogical feedback.
+        Evaluate lesson structure from what the material actually contains (objective text, introduction,
+        explanation / example / exercise slides, summary). The generator always adds an objective slide,
+        so only real objective text counts.
         """
-        has_intro = (material.introduction is not None and len(material.introduction) > 0) or any(
-            "導入" in s.badge or "導入" in s.title for s in material.slides
-        )
-        has_objectives = len(material.learning_objectives) > 0 or any(
-            "目標" in s.badge or "目標" in s.title for s in material.slides
-        )
-        has_explanation = any(
-            s.badge in ["concept", "formula", "definition", "解説", "公式", "ポイント"] for s in material.slides
-        ) or len(material.slides) >= 3
+        has_objectives = any(o.strip() for o in material.learning_objectives)
+        has_intro = bool(material.introduction and material.introduction.strip()) or any(
+            "導入" in s.badge for s in material.slides)
+        has_explanation = any(any(b in s.badge for b in _EXPLANATION_BADGES) for s in material.slides)
         has_example = any(s.has_example for s in material.slides)
         has_exercise = any(s.has_exercise for s in material.slides)
-        has_summary = (material.summary is not None and len(material.summary) > 0) or any(
-            "まとめ" in s.badge or "まとめ" in s.title for s in material.slides
-        )
+        has_summary = bool(material.summary and material.summary.strip())
 
-        # Baseline structure scoring
-        points = 40  # baseline
-        if has_objectives: points += 12
-        if has_intro: points += 10
-        if has_explanation: points += 12
-        if has_example: points += 14
-        if has_exercise: points += 12
-        if has_summary: points += 10
+        present = {"objectives": has_objectives, "introduction": has_intro, "explanation": has_explanation,
+                   "example": has_example, "exercise": has_exercise, "summary": has_summary}
+        structure_score = sum(COMPONENT_POINTS[k] for k, ok in present.items() if ok)
 
-        structure_score = min(100, max(50, points))
+        is_curriculum_matched, curriculum_msg = self.check_curriculum_match(
+            material.unit, material.subject, material.lesson_title)
 
-        # Check curriculum match
-        from typing import Tuple
-        is_curriculum_matched, curriculum_msg = self.check_curriculum_match(material.unit, material.subject)
-
-        # Build narrative flow analysis
         flow_parts = []
         if has_objectives:
             flow_parts.append("本時の目標が明示されており、生徒が見通しを持って学習に臨める構成です。")
+        else:
+            flow_parts.append("本時の目標が明示されていません。授業の冒頭で到達目標を示すと見通しが持ちやすくなります。")
         if has_intro:
-            flow_parts.append("身近な題材や導入問題による動機づけが適切に配置されています。")
+            flow_parts.append("導入で学習内容への動機づけが用意されています。")
         if has_example and has_exercise:
-            flow_parts.append("例題による解法の確認から練習問題による自力演習へとスムーズに接続されています。")
+            flow_parts.append("例題による解法の確認から練習問題による自力演習へと接続されています。")
         elif has_example:
-            flow_parts.append("例題が丁寧に解説されています。生徒の定着を確認する練習問題の配置も検討できます。")
+            flow_parts.append("例題は用意されていますが、生徒の定着を確かめる練習問題がありません。")
+        elif has_exercise:
+            flow_parts.append("練習問題はありますが、解法を示す例題がありません。")
+        else:
+            flow_parts.append("例題・練習問題がありません。")
         if has_summary:
             flow_parts.append("授業終盤に本時の重要事項を振り返るまとめが用意されています。")
-
-        flow_narrative = " ".join(flow_parts) if flow_parts else "基本的な授業展開が構成されています。"
+        missing = [k for k, ok in present.items() if not ok]
+        if not missing:
+            flow_parts.append("授業の基本要素（目標・導入・解説・例題・練習・まとめ）がすべて揃っています。")
 
         return PedagogicalEvaluation(
             structure_score=structure_score,
@@ -99,6 +86,6 @@ class PedagogyEvaluator:
             has_example=has_example,
             has_exercise=has_exercise,
             has_summary=has_summary,
-            flow_coherence_analysis=flow_narrative,
+            flow_coherence_analysis=" ".join(flow_parts),
             curriculum_alignment_analysis=curriculum_msg,
         )

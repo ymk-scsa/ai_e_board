@@ -2,6 +2,7 @@
 Streamlit UI Component for System B (Educational Quality Evaluation and Classroom Operation).
 """
 
+import html
 import json
 from pathlib import Path
 from typing import Optional
@@ -10,7 +11,10 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 import config
-from models.schemas import Lesson, ElectronicBoardPresentation
+from pydantic import ValidationError
+
+from models.samples import get_mock_lesson_for_sample
+from models.schemas import Lesson, ElectronicBoardPresentation, lesson_fingerprint
 from models.evaluation_schemas import EvaluationResult, ImprovementSuggestion
 from system_b.pipeline import EvaluationPipeline
 
@@ -47,31 +51,33 @@ class EvaluationUI:
             if st.session_state.get("parsed_lesson"):
                 target_lesson = st.session_state.parsed_lesson
                 st.success(f"✅ システムAで生成・確定された教材「{target_lesson.lesson_title}」が読み込まれています。")
+                if st.session_state.get("is_mock"):
+                    st.warning("⚠️ この教材はデモ用サンプル授業です（板書画像のAI解析結果ではありません）。")
             else:
                 st.info("ℹ️ システムAで教材をまだ生成していません。画面上部のモード切替で「🎨 電子黒板教材生成」を行うか、他のアップロード方法を選択してください。")
 
         elif input_mode == "② Lesson JSON ファイルをアップロード":
             uploaded_json = st.file_uploader("Lesson JSON ファイルを選択", type=["json"], key="b_json_uploader")
             if uploaded_json:
-                target_json_str = uploaded_json.getvalue().decode("utf-8")
-                st.success(f"✅ JSONファイル「{uploaded_json.name}」がアップロードされました。")
+                target_json_str = cls._decode_upload(uploaded_json)
+                if target_json_str is not None:
+                    st.success(f"✅ JSONファイル「{uploaded_json.name}」がアップロードされました。")
 
         elif input_mode == "③ 電子黒板 HTML ファイルをアップロード":
             uploaded_html = st.file_uploader("電子黒板 HTML ファイルを選択", type=["html", "htm"], key="b_html_uploader")
             if uploaded_html:
-                target_html = uploaded_html.getvalue().decode("utf-8")
-                st.success(f"✅ HTMLファイル「{uploaded_html.name}」がアップロードされました。")
+                target_html = cls._decode_upload(uploaded_html)
+                if target_html is not None:
+                    st.success(f"✅ HTMLファイル「{uploaded_html.name}」がアップロードされました。")
 
         elif input_mode == "④ 研究用プリセット教材":
             col_p1, col_p2 = st.columns(2)
             with col_p1:
                 if st.button("📚 プリセット: 高校数学A「順列」", use_container_width=True):
-                    from app import get_mock_lesson_for_sample
                     target_lesson = get_mock_lesson_for_sample("permutation")
                     st.session_state.preset_lesson = target_lesson
             with col_p2:
                 if st.button("📚 プリセット: 高校数学I「平方完成」", use_container_width=True):
-                    from app import get_mock_lesson_for_sample
                     target_lesson = get_mock_lesson_for_sample("quadratic")
                     st.session_state.preset_lesson = target_lesson
 
@@ -89,7 +95,10 @@ class EvaluationUI:
                 placeholder="例: 高校1年生向けの授業です。例題の難易度とスライドの情報量を重点的に見てください。",
             )
         with eval_c2:
-            use_llm_toggle = st.checkbox("Ollama LLMによる定性フィードバック補強", value=True)
+            use_llm_toggle = st.checkbox(
+                "ローカルLLMによる講評を追加（GPUで約1分）", value=False,
+                help="オフのときは採点ルールだけで即座に評価します。オンにすると総評・良い点・注意点の文章をAIが書き直します（点数は変わりません）。",
+            )
 
         start_eval_btn = st.button("🚀 教育品質評価を実行する", type="primary", use_container_width=True)
 
@@ -99,40 +108,52 @@ class EvaluationUI:
                 return
 
             with st.spinner("教材の構成、教育目標整合性、16:9視認性、認知負荷を多角的に分析中..."):
-                result = None
-                json_p = None
-                html_p = None
-
-                if target_lesson:
-                    result, json_p, html_p = pipeline.evaluate_from_lesson(
-                        lesson=target_lesson,
-                        presentation=st.session_state.get("generated_presentation"),
-                        custom_focus=eval_focus,
-                        use_llm=use_llm_toggle,
-                    )
-                elif target_json_str:
-                    result, json_p, html_p = pipeline.evaluate_from_json_string(
-                        json_text=target_json_str,
-                        custom_focus=eval_focus,
-                        use_llm=use_llm_toggle,
-                    )
-                elif target_html:
-                    result, json_p, html_p = pipeline.evaluate_from_html_content(
-                        html_content=target_html,
-                        custom_focus=eval_focus,
-                        use_llm=use_llm_toggle,
-                    )
-
+                try:
+                    result, json_p, html_p = cls._run_evaluation(
+                        pipeline, target_lesson, target_json_str, target_html, eval_focus, use_llm_toggle)
+                except (ValueError, ValidationError) as e:
+                    st.error(f"教材ファイルを読み取れませんでした。システムAで出力した JSON / HTML か確認してください。\n\n詳細: {e}")
+                    return
                 st.session_state.eval_result = result
                 st.session_state.eval_json_path = str(json_p)
                 st.session_state.eval_html_path = str(html_p)
                 st.success("✅ 評価が完了し、レポートを生成しました！")
+                if use_llm_toggle and result.evaluated_model == "deterministic_rules":
+                    st.warning("AIによる講評を取得できなかったため、採点ルールによる評価のみを表示しています。")
 
         # Render Results Dashboard
         res: Optional[EvaluationResult] = st.session_state.eval_result
         if res:
-            st.markdown("---")
-            cls._render_evaluation_dashboard(res)
+            cls._render_results(res)
+
+    @staticmethod
+    def _decode_upload(uploaded) -> Optional[str]:
+        """Decode an uploaded text file (UTF-8 with or without BOM)."""
+        try:
+            return uploaded.getvalue().decode("utf-8-sig")
+        except UnicodeDecodeError:
+            st.error(f"「{uploaded.name}」は UTF-8 のテキストではないため読み込めません。")
+            return None
+
+    @staticmethod
+    def _run_evaluation(pipeline, target_lesson, target_json_str, target_html, eval_focus, use_llm_toggle):
+        if target_lesson:
+            # 生成済みスライドは、同じ授業データから作られたものだけを使う（古いスライドの評価を防ぐ）
+            presentation = st.session_state.get("generated_presentation")
+            if st.session_state.get("presentation_lesson_hash") != lesson_fingerprint(target_lesson):
+                presentation = None
+            return pipeline.evaluate_from_lesson(
+                lesson=target_lesson, presentation=presentation, custom_focus=eval_focus, use_llm=use_llm_toggle)
+        if target_json_str:
+            return pipeline.evaluate_from_json_string(
+                json_text=target_json_str, custom_focus=eval_focus, use_llm=use_llm_toggle)
+        return pipeline.evaluate_from_html_content(
+            html_content=target_html, custom_focus=eval_focus, use_llm=use_llm_toggle)
+
+    @classmethod
+    def _render_results(cls, res: EvaluationResult):
+        st.markdown("---")
+        cls._render_evaluation_dashboard(res)
 
     @classmethod
     def _render_evaluation_dashboard(cls, res: EvaluationResult):
@@ -146,7 +167,7 @@ class EvaluationUI:
                 f"""
                 <div style="text-align: center; padding: 20px; background: #eff6ff; border: 2px solid #3b82f6; border-radius: 12px;">
                     <div style="font-size: 0.95rem; font-weight: 700; color: #1e40af;">総合教育品質スコア</div>
-                    <div style="font-size: 3.5rem; font-weight: 900; color: #1e3a8a; line-height: 1.1;">{res.overall_score}</div>
+                    <div style="font-size: 3.5rem; font-weight: 900; color: #1e3a8a; line-height: 1.1;">{html.escape(str(res.overall_score))}</div>
                     <div style="font-size: 0.85rem; color: #64748b;">/ 100点</div>
                 </div>
                 """,
